@@ -1,0 +1,91 @@
+# MongoDB Sharded Cluster cho Windows
+# Đầy đủ: Sharding + Replication + Failover
+# 
+# Kiến trúc:
+#   - 1 Config Server (lưu metadata)
+#   - 3 Shards (mỗi shard = 1 chi nhánh: HN, DN, HCM)
+#   - 1 Mongos Router (điều phối requests)
+
+services:
+  # ============================================
+  # CONFIG SERVER - Lưu metadata của cluster
+  # ============================================
+  configsvr:
+    image: mongo:7.0
+    container_name: configsvr
+    command: mongod --configsvr --replSet configRS --port 27017 --bind_ip_all
+    ports:
+      - "27100:27017"
+    volumes:
+      - configsvr_data:/data/db
+    networks:
+      - mongo-shard-net
+
+  # ============================================
+  # SHARD 1 - Chi nhánh HÀ NỘI
+  # ============================================
+  shard1:
+    image: mongo:7.0
+    container_name: shard1
+    command: mongod --shardsvr --replSet shard1RS --port 27017 --bind_ip_all
+    ports:
+      - "27101:27017"
+    volumes:
+      - shard1_data:/data/db
+    networks:
+      - mongo-shard-net
+
+  # ============================================
+  # SHARD 2 - Chi nhánh ĐÀ NẴNG
+  # ============================================
+  shard2:
+    image: mongo:7.0
+    container_name: shard2
+    command: mongod --shardsvr --replSet shard2RS --port 27017 --bind_ip_all
+    ports:
+      - "27102:27017"
+    volumes:
+      - shard2_data:/data/db
+    networks:
+      - mongo-shard-net
+
+  # ============================================
+  # SHARD 3 - Chi nhánh HỒ CHÍ MINH
+  # ============================================
+  shard3:
+    image: mongo:7.0
+    container_name: shard3
+    command: mongod --shardsvr --replSet shard3RS --port 27017 --bind_ip_all
+    ports:
+      - "27103:27017"
+    volumes:
+      - shard3_data:/data/db
+    networks:
+      - mongo-shard-net
+
+  # ============================================
+  # MONGOS ROUTER - Điều phối requests
+  # ============================================
+  mongos:
+    image: mongo:7.0
+    container_name: mongos
+    command: mongos --configdb configRS/configsvr:27017 --port 27017 --bind_ip_all
+    ports:
+      - "27017:27017"
+    depends_on:
+      - configsvr
+      - shard1
+      - shard2
+      - shard3
+    networks:
+      - mongo-shard-net
+
+networks:
+  mongo-shard-net:
+    driver: bridge
+
+volumes:
+  configsvr_data:
+  shard1_data:
+  shard2_data:
+  shard3_data:
