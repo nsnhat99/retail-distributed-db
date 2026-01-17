@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/database');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
+const { startHealthMonitoring, getHealthStatus, forceHealthCheck } = require('./services/shardHealth');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -13,8 +14,11 @@ const userRoutes = require('./routes/users');
 
 const app = express();
 
-// Connect to database
-connectDB();
+// Connect to database and start shard health monitoring
+connectDB().then(() => {
+  // Start monitoring shard health after DB connection
+  startHealthMonitoring();
+});
 
 // Middleware
 app.use(cors({
@@ -34,11 +38,30 @@ if (process.env.NODE_ENV === 'development') {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+  const shardHealth = getHealthStatus();
   res.json({
-    status: 'OK',
+    status: shardHealth.allShardsHealthy ? 'OK' : 'DEGRADED',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    shards: shardHealth
   });
+});
+
+// Shard health endpoint - check and refresh shard status
+app.get('/api/shard-health', async (req, res) => {
+  try {
+    const health = await forceHealthCheck();
+    res.json({
+      success: true,
+      data: health
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to check shard health',
+      error: error.message
+    });
+  }
 });
 
 // API Routes
@@ -82,6 +105,10 @@ app.get('/api', (req, res) => {
         'GET /api/stats/top-products': 'Top selling products',
         'GET /api/stats/by-branch': 'Statistics by branch',
         'GET /api/stats/by-category': 'Sales by category'
+      },
+      shardHealth: {
+        'GET /health': 'Server health check with shard status',
+        'GET /api/shard-health': 'Force check and refresh shard health status'
       },
       users: {
         'GET /api/users': 'Get all users (Admin)',

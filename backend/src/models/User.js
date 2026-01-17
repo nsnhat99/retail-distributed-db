@@ -39,8 +39,12 @@ const userSchema = new mongoose.Schema({
   },
   branch: {
     type: String,
-    enum: ['hanoi', 'danang', 'hcm'],
-    required: [true, 'Branch is required']
+    enum: ['hanoi', 'danang', 'hcm', null],
+    required: [
+      function() { return this.role !== 'admin'; },
+      'Branch is required for staff and customer'
+    ],
+    default: null
   },
   isActive: {
     type: Boolean,

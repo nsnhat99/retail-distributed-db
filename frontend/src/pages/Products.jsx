@@ -36,6 +36,7 @@ const Products = () => {
     stock: "",
     unit: "item",
     supplier: "",
+    branch: "",
   })
   const categories = [
     { value: "electronics", label: "Điện tử" },
@@ -61,8 +62,14 @@ const Products = () => {
       const res = await productAPI.getAll(params)
       setProducts(res.data.data.products)
       setPagination(res.data.data.pagination)
+
+      // Hiển thị warning nếu có chi nhánh không khả dụng
+      if (res.data.warning) {
+        toast.warning(res.data.warning)
+      }
     } catch (e) {
-      toast.error("Không thể tải sản phẩm")
+      const message = e.response?.data?.message || "Không thể tải sản phẩm"
+      toast.error(message)
     } finally {
       setLoading(false)
     }
@@ -86,14 +93,15 @@ const Products = () => {
     }
   }
 
-  const handleDelete = async (id) => {
+  const handleDelete = async (id, productBranch) => {
     if (!window.confirm("Xóa sản phẩm này?")) return
     try {
-      await productAPI.delete(id)
+      await productAPI.delete(id, productBranch)
       toast.success("Đã xóa")
       fetchProducts()
     } catch (e) {
-      toast.error("Không thể xóa")
+      const message = e.response?.data?.message || "Không thể xóa"
+      toast.error(message)
     }
   }
 
@@ -109,6 +117,7 @@ const Products = () => {
       stock: p.stock,
       unit: p.unit,
       supplier: p.supplier || "",
+      branch: p.branch || "",
     })
     setShowModal(true)
   }
@@ -124,6 +133,7 @@ const Products = () => {
       stock: "",
       unit: "item",
       supplier: "",
+      branch: "",
     })
   }
   const fmt = (v) =>
@@ -288,7 +298,7 @@ const Products = () => {
                         <HiOutlinePencil className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={() => handleDelete(p._id)}
+                        onClick={() => handleDelete(p._id, p.branch)}
                         className="p-2 text-red-600 hover:bg-red-50 rounded-lg"
                       >
                         <HiOutlineTrash className="w-4 h-4" />
@@ -454,6 +464,28 @@ const Products = () => {
                   />
                 </div>
               </div>
+              {user?.role === "admin" && (
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Chi nhánh {!user?.branch && "*"}
+                  </label>
+                  <select
+                    required={!user?.branch}
+                    className="input-field"
+                    value={form.branch}
+                    onChange={(e) =>
+                      setForm({ ...form, branch: e.target.value })
+                    }
+                  >
+                    <option value="">
+                      {user?.branch ? "Giữ nguyên chi nhánh" : "Chọn chi nhánh"}
+                    </option>
+                    <option value="hanoi">Hà Nội</option>
+                    <option value="danang">Đà Nẵng</option>
+                    <option value="hcm">TP.HCM</option>
+                  </select>
+                </div>
+              )}
               <div className="flex justify-end gap-3 pt-4 border-t">
                 <button
                   type="button"

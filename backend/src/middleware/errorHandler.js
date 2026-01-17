@@ -57,6 +57,92 @@ const errorHandler = (err, req, res, next) => {
     error = new AppError('Token expired', 401);
   }
 
+  // Shard unavailable error (specific shard is down) - Kiểm tra trước để có message chi tiết
+  if (err.message?.includes('Could not find host matching read preference')) {
+    // Extract shard name from error message
+    const shardMatch = err.message.match(/set (shard\d+RS)/);
+    const shardName = shardMatch ? shardMatch[1] : 'unknown';
+
+    // Mark shard as unavailable in health cache immediately
+    try {
+      const { markShardUnavailable } = require('../services/shardHealth');
+      if (markShardUnavailable) {
+        markShardUnavailable(shardName);
+        console.log(`Marked ${shardName} as unavailable due to query error`);
+      }
+    } catch (e) {
+      // Ignore if service not available
+    }
+
+    // Map shard to branch names
+    const shardBranchMap = {
+      'shard1RS': 'Hà Nội',
+      'shard2RS': 'Đà Nẵng',
+      'shard3RS': 'HCM'
+    };
+
+    const branchName = shardBranchMap[shardName] || shardName;
+    const message = `Chi nhánh ${branchName} hiện không khả dụng. Vui lòng thử lại sau.`;
+
+    error = new AppError(message, 503);
+    error.shardUnavailable = true;
+    error.affectedShard = shardName;
+  }
+  // Server Selection Timeout (khi MongoDB không tìm thấy server khả dụng)
+  else if (err.message?.includes('Server selection timed out')) {
+    // Try to extract shard info
+    const shardMatch = err.message.match(/set (shard\d+RS)/);
+    const shardName = shardMatch ? shardMatch[1] : null;
+
+    if (shardName) {
+      try {
+        const { markShardUnavailable } = require('../services/shardHealth');
+        if (markShardUnavailable) {
+          markShardUnavailable(shardName);
+        }
+      } catch (e) {}
+
+      const shardBranchMap = {
+        'shard1RS': 'Hà Nội',
+        'shard2RS': 'Đà Nẵng',
+        'shard3RS': 'HCM'
+      };
+      const branchName = shardBranchMap[shardName] || shardName;
+      error = new AppError(`Chi nhánh ${branchName} hiện không khả dụng (timeout). Vui lòng thử lại sau.`, 503);
+    } else {
+      error = new AppError('Dữ liệu tạm thời không khả dụng. Vui lòng thử lại sau.', 503);
+    }
+  }
+  // MongoDB Connection/Network errors (khi shard không khả dụng)
+  else if (err.name === 'MongoServerError' || err.name === 'MongoNetworkError') {
+    // Try to extract shard info from error
+    const shardMatch = err.message?.match(/set (shard\d+RS)/);
+    const shardName = shardMatch ? shardMatch[1] : null;
+
+    if (shardName) {
+      try {
+        const { markShardUnavailable } = require('../services/shardHealth');
+        if (markShardUnavailable) {
+          markShardUnavailable(shardName);
+        }
+      } catch (e) {}
+
+      const shardBranchMap = {
+        'shard1RS': 'Hà Nội',
+        'shard2RS': 'Đà Nẵng',
+        'shard3RS': 'HCM'
+      };
+      const branchName = shardBranchMap[shardName] || shardName;
+      error = new AppError(`Chi nhánh ${branchName} hiện không khả dụng. Vui lòng thử lại sau.`, 503);
+    } else {
+      error = new AppError('Lỗi kết nối database. Một số dữ liệu tạm thời không khả dụng.', 503);
+    }
+  }
+  // MongoDB Topology errors (khi không thể kết nối đến shard)
+  else if (err.name === 'MongoTopologyClosedError' || err.message?.includes('topology')) {
+    error = new AppError('Dịch vụ database tạm thời không khả dụng. Vui lòng thử lại sau.', 503);
+  }
+
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || 'Server Error',

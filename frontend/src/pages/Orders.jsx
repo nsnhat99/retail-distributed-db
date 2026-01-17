@@ -40,16 +40,22 @@ const Orders = () => {
       const res = await orderAPI.getAll(params)
       setOrders(res.data.data.orders)
       setPagination(res.data.data.pagination)
+
+      // Hiển thị warning nếu có chi nhánh không khả dụng
+      if (res.data.warning) {
+        toast.warning(res.data.warning)
+      }
     } catch (e) {
-      toast.error("Không thể tải đơn hàng")
+      const message = e.response?.data?.message || "Không thể tải đơn hàng"
+      toast.error(message)
     } finally {
       setLoading(false)
     }
   }
 
-  const handleStatusChange = async (id, status) => {
+  const handleStatusChange = async (id, status, orderBranch) => {
     try {
-      await orderAPI.updateStatus(id, status)
+      await orderAPI.updateStatus(id, status, orderBranch)
       toast.success("Cập nhật trạng thái thành công")
       fetchOrders()
       if (selectedOrder?._id === id) {
@@ -57,18 +63,20 @@ const Orders = () => {
         setSelectedOrder(res.data.data.order)
       }
     } catch (e) {
-      toast.error("Không thể cập nhật")
+      const message = e.response?.data?.message || "Không thể cập nhật"
+      toast.error(message)
     }
   }
 
-  const handleCancel = async (id) => {
+  const handleCancel = async (id, orderBranch) => {
     if (!window.confirm("Hủy đơn hàng này?")) return
     try {
-      await orderAPI.cancel(id)
+      await orderAPI.cancel(id, orderBranch)
       toast.success("Đã hủy đơn")
       fetchOrders()
     } catch (e) {
-      toast.error("Không thể hủy")
+      const message = e.response?.data?.message || "Không thể hủy"
+      toast.error(message)
     }
   }
 
@@ -247,7 +255,7 @@ const Orders = () => {
                         <>
                           <button
                             onClick={() =>
-                              handleStatusChange(o._id, "confirmed")
+                              handleStatusChange(o._id, "confirmed", o.branch)
                             }
                             className="p-2 text-green-600 hover:bg-green-50 rounded-lg"
                             title="Xác nhận"
@@ -255,7 +263,7 @@ const Orders = () => {
                             <HiOutlineCheck className="w-4 h-4" />
                           </button>
                           <button
-                            onClick={() => handleCancel(o._id)}
+                            onClick={() => handleCancel(o._id, o.branch)}
                             className="p-2 text-red-600 hover:bg-red-50 rounded-lg"
                             title="Hủy"
                           >
@@ -265,7 +273,7 @@ const Orders = () => {
                       )}
                       {o.status === "confirmed" && (
                         <button
-                          onClick={() => handleStatusChange(o._id, "completed")}
+                          onClick={() => handleStatusChange(o._id, "completed", o.branch)}
                           className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg"
                           title="Hoàn thành"
                         >

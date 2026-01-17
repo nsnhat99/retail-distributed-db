@@ -3,7 +3,13 @@ const mongoose = require('mongoose');
 const connectDB = async () => {
   try {
     const conn = await mongoose.connect(process.env.MONGODB_URI, {
-      // Mongoose 8 không cần các options này nữa, nhưng giữ để tương thích
+      // Cấu hình cho Sharded Cluster - xử lý failover
+      readPreference: 'primaryPreferred', // Đọc từ primary, fallback sang secondary nếu primary tắt
+      readConcern: { level: 'local' }, // Đọc data đã ghi nhận ở local, không đợi replication
+      writeConcern: { w: 'majority', wtimeout: 5000 }, // Ghi vào majority nodes, timeout 5s
+      serverSelectionTimeoutMS: 5000, // Timeout chọn server 5s thay vì 30s mặc định
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
     });
 
     console.log(`✅ MongoDB Connected: ${conn.connection.host}`);

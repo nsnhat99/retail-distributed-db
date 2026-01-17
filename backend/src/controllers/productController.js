@@ -1,6 +1,7 @@
 const Product = require('../models/Product');
 const Activity = require('../models/Activity');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
+const { buildQueryWithAvailableBranches } = require('../middleware/shardFilter');
 
 // @desc    Get all products
 // @route   GET /api/products
@@ -19,15 +20,22 @@ const getProducts = asyncHandler(async (req, res) => {
     inStock
   } = req.query;
 
-  // Build query
-  const query = { isActive: true };
+  // Build query with shard health awareness
+  const baseQuery = { isActive: true };
 
-  // Filter by branch (staff chỉ xem branch của mình)
-  if (req.user.role !== 'admin') {
-    query.branch = req.user.branch;
-  } else if (branch) {
-    query.branch = branch;
+  // Build branch filter based on shard availability
+  const branchResult = buildQueryWithAvailableBranches(baseQuery, {
+    userRole: req.user.role,
+    userBranch: req.user.branch,
+    requestedBranch: branch
+  });
+
+  // If requested branch is unavailable, return error
+  if (branchResult.unavailable) {
+    throw new AppError(branchResult.error, 503);
   }
+
+  const query = branchResult.query;
 
   // Filter by category
   if (category) {
@@ -74,7 +82,10 @@ const getProducts = asyncHandler(async (req, res) => {
         totalItems: total,
         itemsPerPage: parseInt(limit)
       }
-    }
+    },
+    // Include warning if some branches are unavailable
+    ...(branchResult.warning && { warning: branchResult.warning }),
+    ...(branchResult.excludedBranches && { excludedBranches: branchResult.excludedBranches })
   });
 });
 
@@ -112,8 +123,19 @@ const createProduct = asyncHandler(async (req, res) => {
     imageUrl
   } = req.body;
 
-  // Staff chỉ được tạo product cho branch của mình
-  const productBranch = req.user.role === 'admin' ? branch : req.user.branch;
+  // Xác định branch cho sản phẩm
+  let productBranch;
+  if (req.user.role === 'admin') {
+    // Admin có branch cố định: dùng branch đó, hoặc cho phép chọn branch khác
+    // Super admin (branch = null): bắt buộc phải chọn branch
+    productBranch = branch || req.user.branch;
+    if (!productBranch) {
+      throw new AppError('Vui lòng chọn chi nhánh cho sản phẩm', 400);
+    }
+  } else {
+    // Staff: chỉ được tạo product cho branch của mình
+    productBranch = req.user.branch;
+  }
 
   const product = await Product.create({
     sku,
@@ -152,7 +174,21 @@ const createProduct = asyncHandler(async (req, res) => {
 // @route   PUT /api/products/:id
 // @access  Private (Admin, Staff)
 const updateProduct = asyncHandler(async (req, res) => {
-  let product = await Product.findById(req.params.id);
+  const { branch } = req.body;
+  const queryOptions = { maxTimeMS: 5000 };
+
+  // Build query với shard key nếu có để tránh broadcast query
+  let product;
+  if (branch) {
+    // Nếu có branch, query trực tiếp vào shard đó
+    product = await Product.findOne({ _id: req.params.id, branch }, null, queryOptions);
+  } else if (req.user.branch) {
+    // Staff: chỉ query trong branch của mình
+    product = await Product.findOne({ _id: req.params.id, branch: req.user.branch }, null, queryOptions);
+  } else {
+    // Super admin: phải broadcast query
+    product = await Product.findById(req.params.id).maxTimeMS(5000);
+  }
 
   if (!product) {
     throw new AppError('Product not found', 404);
@@ -174,26 +210,36 @@ const updateProduct = asyncHandler(async (req, res) => {
     stock: product.stock
   };
 
-  product = await Product.findByIdAndUpdate(
-    req.params.id,
-    req.body,
-    { new: true, runValidators: true }
-  );
+  // Update với shard key
+  try {
+    product = await Product.findOneAndUpdate(
+      { _id: req.params.id, branch: product.branch },
+      req.body,
+      { new: true, runValidators: true, maxTimeMS: 5000 }
+    );
+  } catch (saveError) {
+    console.error(`Error updating product ${req.params.id}:`, saveError.message);
+    throw saveError;
+  }
 
-  // Log activity
-  await Activity.log({
-    userId: req.user._id,
-    username: req.user.username,
-    action: 'update_product',
-    entityType: 'product',
-    entityId: product._id,
-    branch: product.branch,
-    details: {
-      sku: product.sku,
-      changes: { old: oldData, new: { name: product.name, price: product.price, stock: product.stock } }
-    },
-    ipAddress: req.ip
-  });
+  // Log activity - không block nếu fail
+  try {
+    await Activity.log({
+      userId: req.user._id,
+      username: req.user.username,
+      action: 'update_product',
+      entityType: 'product',
+      entityId: product._id,
+      branch: product.branch,
+      details: {
+        sku: product.sku,
+        changes: { old: oldData, new: { name: product.name, price: product.price, stock: product.stock } }
+      },
+      ipAddress: req.ip
+    });
+  } catch (logError) {
+    console.warn(`Warning: Could not log activity for product ${product.sku}:`, logError.message);
+  }
 
   res.json({
     success: true,
@@ -206,7 +252,18 @@ const updateProduct = asyncHandler(async (req, res) => {
 // @route   DELETE /api/products/:id
 // @access  Private (Admin, Staff)
 const deleteProduct = asyncHandler(async (req, res) => {
-  const product = await Product.findById(req.params.id);
+  const { branch } = req.body || {};
+  const queryOptions = { maxTimeMS: 5000 };
+
+  // Build query với shard key nếu có để tránh broadcast query
+  let product;
+  if (branch) {
+    product = await Product.findOne({ _id: req.params.id, branch }, null, queryOptions);
+  } else if (req.user.branch) {
+    product = await Product.findOne({ _id: req.params.id, branch: req.user.branch }, null, queryOptions);
+  } else {
+    product = await Product.findById(req.params.id).maxTimeMS(5000);
+  }
 
   if (!product) {
     throw new AppError('Product not found', 404);
@@ -217,21 +274,30 @@ const deleteProduct = asyncHandler(async (req, res) => {
     throw new AppError('You can only delete products in your branch', 403);
   }
 
-  // Soft delete
+  // Soft delete với shard key
   product.isActive = false;
-  await product.save();
+  try {
+    await product.save();
+  } catch (saveError) {
+    console.error(`Error deleting product ${product.sku}:`, saveError.message);
+    throw saveError;
+  }
 
-  // Log activity
-  await Activity.log({
-    userId: req.user._id,
-    username: req.user.username,
-    action: 'delete_product',
-    entityType: 'product',
-    entityId: product._id,
-    branch: product.branch,
-    details: { sku: product.sku, name: product.name },
-    ipAddress: req.ip
-  });
+  // Log activity - không block nếu fail
+  try {
+    await Activity.log({
+      userId: req.user._id,
+      username: req.user.username,
+      action: 'delete_product',
+      entityType: 'product',
+      entityId: product._id,
+      branch: product.branch,
+      details: { sku: product.sku, name: product.name },
+      ipAddress: req.ip
+    });
+  } catch (logError) {
+    console.warn(`Warning: Could not log activity for deleted product ${product.sku}:`, logError.message);
+  }
 
   res.json({
     success: true,
@@ -255,9 +321,18 @@ const getCategories = asyncHandler(async (req, res) => {
 // @route   PATCH /api/products/:id/stock
 // @access  Private (Admin, Staff)
 const updateStock = asyncHandler(async (req, res) => {
-  const { quantity, operation } = req.body; // operation: 'add' or 'subtract'
+  const { quantity, operation, branch } = req.body; // operation: 'add' or 'subtract'
+  const queryOptions = { maxTimeMS: 5000 };
 
-  const product = await Product.findById(req.params.id);
+  // Build query với shard key nếu có để tránh broadcast query
+  let product;
+  if (branch) {
+    product = await Product.findOne({ _id: req.params.id, branch }, null, queryOptions);
+  } else if (req.user.branch) {
+    product = await Product.findOne({ _id: req.params.id, branch: req.user.branch }, null, queryOptions);
+  } else {
+    product = await Product.findById(req.params.id).maxTimeMS(5000);
+  }
 
   if (!product) {
     throw new AppError('Product not found', 404);
@@ -281,22 +356,31 @@ const updateStock = asyncHandler(async (req, res) => {
     throw new AppError('Invalid operation. Use "add" or "subtract"', 400);
   }
 
-  await product.save();
+  try {
+    await product.save();
+  } catch (saveError) {
+    console.error(`Error updating stock for product ${product.sku}:`, saveError.message);
+    throw saveError;
+  }
 
-  // Log activity
-  await Activity.log({
-    userId: req.user._id,
-    username: req.user.username,
-    action: 'update_product',
-    entityType: 'product',
-    entityId: product._id,
-    branch: product.branch,
-    details: {
-      sku: product.sku,
-      stockChange: { operation, quantity, oldStock, newStock: product.stock }
-    },
-    ipAddress: req.ip
-  });
+  // Log activity - không block nếu fail
+  try {
+    await Activity.log({
+      userId: req.user._id,
+      username: req.user.username,
+      action: 'update_product',
+      entityType: 'product',
+      entityId: product._id,
+      branch: product.branch,
+      details: {
+        sku: product.sku,
+        stockChange: { operation, quantity, oldStock, newStock: product.stock }
+      },
+      ipAddress: req.ip
+    });
+  } catch (logError) {
+    console.warn(`Warning: Could not log activity for stock update ${product.sku}:`, logError.message);
+  }
 
   res.json({
     success: true,

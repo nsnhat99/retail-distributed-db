@@ -39,8 +39,8 @@ const activitySchema = new mongoose.Schema({
   },
   branch: {
     type: String,
-    enum: ['hanoi', 'danang', 'hcm'],
-    required: true
+    enum: ['hanoi', 'danang', 'hcm', null],
+    default: null
   },
   details: {
     type: mongoose.Schema.Types.Mixed // Flexible field cho thông tin chi tiết
