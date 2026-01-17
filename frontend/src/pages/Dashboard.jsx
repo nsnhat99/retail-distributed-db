@@ -68,12 +68,24 @@ const Dashboard = () => {
       setData(o.data.data)
       setRevenue(r.data.data)
       setTopProducts(t.data.data.topProducts)
+
+      // Hiển thị warning nếu có chi nhánh không khả dụng
+      if (o.data.warning) {
+        toast.warning(o.data.warning)
+      }
+
       if (user?.role === "admin") {
         const b = await statsAPI.getByBranch()
         setBranchStats(b.data.data.branchStats)
+
+        // Hiển thị warning từ branch stats nếu có
+        if (b.data.warning) {
+          toast.warning(b.data.warning)
+        }
       }
     } catch (e) {
-      toast.error("Không thể tải dữ liệu")
+      const message = e.response?.data?.message || "Không thể tải dữ liệu"
+      toast.error(message)
     } finally {
       setLoading(false)
     }

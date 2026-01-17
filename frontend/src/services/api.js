@@ -52,7 +52,7 @@ export const productAPI = {
   getById: (id) => api.get(`/products/${id}`),
   create: (data) => api.post('/products', data),
   update: (id, data) => api.put(`/products/${id}`, data),
-  delete: (id) => api.delete(`/products/${id}`),
+  delete: (id, branch) => api.delete(`/products/${id}`, { data: { branch } }),
   updateStock: (id, data) => api.patch(`/products/${id}/stock`, data),
   getCategories: () => api.get('/products/categories')
 };
@@ -63,8 +63,8 @@ export const orderAPI = {
   getById: (id) => api.get(`/orders/${id}`),
   getByCode: (code) => api.get(`/orders/code/${code}`),
   create: (data) => api.post('/orders', data),
-  updateStatus: (id, status) => api.patch(`/orders/${id}/status`, { status }),
-  cancel: (id) => api.delete(`/orders/${id}`)
+  updateStatus: (id, status, branch) => api.patch(`/orders/${id}/status`, { status, branch }),
+  cancel: (id, branch) => api.delete(`/orders/${id}`, { data: { branch } })
 };
 
 // ============ Stats APIs ============

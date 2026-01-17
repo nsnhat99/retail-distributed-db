@@ -2,6 +2,7 @@ const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Activity = require('../models/Activity');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
+const { buildQueryWithAvailableBranches } = require('../middleware/shardFilter');
 
 // @desc    Get all orders
 // @route   GET /api/orders
@@ -19,15 +20,19 @@ const getOrders = asyncHandler(async (req, res) => {
     sortOrder = 'desc'
   } = req.query;
 
-  // Build query
-  const query = {};
+  // Build query with shard health awareness
+  const branchResult = buildQueryWithAvailableBranches({}, {
+    userRole: req.user.role,
+    userBranch: req.user.branch,
+    requestedBranch: branch
+  });
 
-  // Filter by branch (staff chỉ xem branch của mình)
-  if (req.user.role !== 'admin') {
-    query.branch = req.user.branch;
-  } else if (branch) {
-    query.branch = branch;
+  // If requested branch is unavailable, return error
+  if (branchResult.unavailable) {
+    throw new AppError(branchResult.error, 503);
   }
+
+  const query = branchResult.query;
 
   // Filter by status
   if (status) {
@@ -71,7 +76,10 @@ const getOrders = asyncHandler(async (req, res) => {
         totalItems: total,
         itemsPerPage: parseInt(limit)
       }
-    }
+    },
+    // Include warning if some branches are unavailable
+    ...(branchResult.warning && { warning: branchResult.warning }),
+    ...(branchResult.excludedBranches && { excludedBranches: branchResult.excludedBranches })
   });
 });
 
@@ -110,7 +118,8 @@ const createOrder = asyncHandler(async (req, res) => {
     discount = 0,
     tax = 0,
     paymentMethod,
-    note
+    note,
+    branch: requestedBranch
   } = req.body;
 
   // Validate items
@@ -118,28 +127,53 @@ const createOrder = asyncHandler(async (req, res) => {
     throw new AppError('Order must have at least one item', 400);
   }
 
-  // Branch của order = branch của staff tạo order
-  const branch = req.user.branch;
+  // Xác định branch cho order
+  let branch;
+  if (req.user.role === 'admin') {
+    // Admin có branch cố định: dùng branch đó, hoặc cho phép chọn branch khác
+    // Super admin (branch = null): bắt buộc phải chọn branch
+    branch = requestedBranch || req.user.branch;
+    if (!branch) {
+      throw new AppError('Vui lòng chọn chi nhánh cho đơn hàng', 400);
+    }
+  } else {
+    // Staff: chỉ được tạo order cho branch của mình
+    branch = req.user.branch;
+  }
 
   // Generate order code
   const orderCode = await Order.generateOrderCode(branch);
 
   // Process items và kiểm tra stock
+  // Sử dụng shard key (branch) để query product, tránh broadcast query
   const processedItems = [];
-  
+  const queryOptions = { maxTimeMS: 5000 };
+
   for (const item of items) {
-    const product = await Product.findById(item.productId);
-    
+    // Query với branch để target đúng shard
+    // Nếu product ở branch khác, sẽ fallback về findById
+    let product = await Product.findOne(
+      { _id: item.productId, branch },
+      null,
+      queryOptions
+    );
+
+    // Nếu không tìm thấy, thử query với branch khác (cho phép order sản phẩm từ chi nhánh khác)
     if (!product) {
-      throw new AppError(`Product not found: ${item.productId}`, 404);
+      product = await Product.findById(item.productId).maxTimeMS(5000);
     }
-    
+
+    if (!product) {
+      throw new AppError(`Không tìm thấy sản phẩm: ${item.productId}`, 404);
+    }
+
     if (product.stock < item.quantity) {
-      throw new AppError(`Insufficient stock for product: ${product.name}. Available: ${product.stock}`, 400);
+      throw new AppError(`Không đủ hàng cho sản phẩm: ${product.name}. Còn lại: ${product.stock}`, 400);
     }
 
     processedItems.push({
       productId: product._id,
+      productBranch: product.branch, // Lưu branch của product để deduct stock đúng shard
       sku: product.sku,
       productName: product.name,
       quantity: item.quantity,
@@ -152,15 +186,24 @@ const createOrder = asyncHandler(async (req, res) => {
   const totalAmount = processedItems.reduce((sum, item) => sum + item.subtotal, 0);
   const finalAmount = totalAmount - discount + tax;
 
-  // Create order
-  const order = await Order.create({
+  // Tạo items cho order (không bao gồm productBranch vì schema không có)
+  const orderItems = processedItems.map(item => ({
+    productId: item.productId,
+    sku: item.sku,
+    productName: item.productName,
+    quantity: item.quantity,
+    price: item.price,
+    subtotal: item.subtotal
+  }));
+
+  // Create order - chỉ thêm customerId nếu có giá trị hợp lệ
+  const orderData = {
     orderCode,
-    customerId,
     customerName,
     customerPhone,
     staffId: req.user._id,
     branch,
-    items: processedItems,
+    items: orderItems,
     totalAmount,
     discount,
     tax,
@@ -168,30 +211,48 @@ const createOrder = asyncHandler(async (req, res) => {
     paymentMethod,
     note,
     status: 'pending'
-  });
+  };
 
-  // Deduct stock
-  for (const item of processedItems) {
-    await Product.findByIdAndUpdate(item.productId, {
-      $inc: { stock: -item.quantity }
-    });
+  // Chỉ thêm customerId nếu có giá trị (không phải chuỗi rỗng)
+  if (customerId && customerId.trim() !== '') {
+    orderData.customerId = customerId;
   }
 
-  // Log activity
-  await Activity.log({
-    userId: req.user._id,
-    username: req.user.username,
-    action: 'create_order',
-    entityType: 'order',
-    entityId: order._id,
-    branch: order.branch,
-    details: {
-      orderCode: order.orderCode,
-      totalAmount: order.finalAmount,
-      itemCount: order.items.length
-    },
-    ipAddress: req.ip
-  });
+  const order = await Order.create(orderData);
+
+  // Deduct stock - sử dụng shard key và không block nếu fail
+  for (const item of processedItems) {
+    try {
+      await Product.findOneAndUpdate(
+        { _id: item.productId, branch: item.productBranch },
+        { $inc: { stock: -item.quantity } },
+        { maxTimeMS: 5000 }
+      );
+    } catch (stockError) {
+      // Nếu không thể cập nhật stock (shard product bị down), log warning nhưng không fail order
+      console.warn(`Warning: Could not deduct stock for product ${item.sku}:`, stockError.message);
+    }
+  }
+
+  // Log activity - không block nếu fail
+  try {
+    await Activity.log({
+      userId: req.user._id,
+      username: req.user.username,
+      action: 'create_order',
+      entityType: 'order',
+      entityId: order._id,
+      branch: order.branch,
+      details: {
+        orderCode: order.orderCode,
+        totalAmount: order.finalAmount,
+        itemCount: order.items.length
+      },
+      ipAddress: req.ip
+    });
+  } catch (logError) {
+    console.warn(`Warning: Could not log activity for order ${order.orderCode}:`, logError.message);
+  }
 
   res.status(201).json({
     success: true,
@@ -204,14 +265,27 @@ const createOrder = asyncHandler(async (req, res) => {
 // @route   PATCH /api/orders/:id/status
 // @access  Private (Admin, Staff)
 const updateOrderStatus = asyncHandler(async (req, res) => {
-  const { status } = req.body;
-  
+  const { status, branch } = req.body;
+
   const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled'];
   if (!validStatuses.includes(status)) {
     throw new AppError('Invalid status', 400);
   }
 
-  const order = await Order.findById(req.params.id);
+  // Build query với shard key nếu có để tránh broadcast query
+  let order;
+  const queryOptions = { maxTimeMS: 5000 }; // 5 second timeout
+
+  if (branch) {
+    // Nếu có branch, query trực tiếp vào shard đó
+    order = await Order.findOne({ _id: req.params.id, branch }, null, queryOptions);
+  } else if (req.user.branch) {
+    // Staff: chỉ query trong branch của mình
+    order = await Order.findOne({ _id: req.params.id, branch: req.user.branch }, null, queryOptions);
+  } else {
+    // Super admin: phải broadcast query
+    order = await Order.findById(req.params.id).maxTimeMS(5000);
+  }
 
   if (!order) {
     throw new AppError('Order not found', 404);
@@ -224,31 +298,48 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
 
   // Nếu cancel, hoàn lại stock
   if (status === 'cancelled' && order.status !== 'cancelled') {
-    for (const item of order.items) {
-      await Product.findByIdAndUpdate(item.productId, {
-        $inc: { stock: item.quantity }
-      });
+    try {
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(item.productId, {
+          $inc: { stock: item.quantity }
+        });
+      }
+    } catch (stockError) {
+      // Nếu không thể cập nhật stock (shard product bị down), vẫn cho phép cancel order
+      // Log warning nhưng không block operation
+      console.warn(`Warning: Could not restore stock for order ${order.orderCode}:`, stockError.message);
     }
   }
 
   const oldStatus = order.status;
   order.status = status;
-  await order.save();
 
-  // Log activity
-  await Activity.log({
-    userId: req.user._id,
-    username: req.user.username,
-    action: 'update_order',
-    entityType: 'order',
-    entityId: order._id,
-    branch: order.branch,
-    details: {
-      orderCode: order.orderCode,
-      statusChange: { from: oldStatus, to: status }
-    },
-    ipAddress: req.ip
-  });
+  try {
+    await order.save();
+  } catch (saveError) {
+    // Nếu không thể save (shard down), throw lỗi rõ ràng
+    console.error(`Error saving order ${order.orderCode}:`, saveError.message);
+    throw saveError;
+  }
+
+  // Log activity - không block nếu fail
+  try {
+    await Activity.log({
+      userId: req.user._id,
+      username: req.user.username,
+      action: 'update_order',
+      entityType: 'order',
+      entityId: order._id,
+      branch: order.branch,
+      details: {
+        orderCode: order.orderCode,
+        statusChange: { from: oldStatus, to: status }
+      },
+      ipAddress: req.ip
+    });
+  } catch (logError) {
+    console.warn(`Warning: Could not log activity for order ${order.orderCode}:`, logError.message);
+  }
 
   res.json({
     success: true,
@@ -261,7 +352,19 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
 // @route   DELETE /api/orders/:id
 // @access  Private (Admin, Staff)
 const cancelOrder = asyncHandler(async (req, res) => {
-  const order = await Order.findById(req.params.id);
+  const { branch } = req.body || {};
+
+  // Build query với shard key nếu có để tránh broadcast query
+  let order;
+  const queryOptions = { maxTimeMS: 5000 };
+
+  if (branch) {
+    order = await Order.findOne({ _id: req.params.id, branch }, null, queryOptions);
+  } else if (req.user.branch) {
+    order = await Order.findOne({ _id: req.params.id, branch: req.user.branch }, null, queryOptions);
+  } else {
+    order = await Order.findById(req.params.id).maxTimeMS(5000);
+  }
 
   if (!order) {
     throw new AppError('Order not found', 404);
@@ -279,27 +382,42 @@ const cancelOrder = asyncHandler(async (req, res) => {
 
   // Hoàn lại stock nếu chưa cancelled
   if (order.status !== 'cancelled') {
-    for (const item of order.items) {
-      await Product.findByIdAndUpdate(item.productId, {
-        $inc: { stock: item.quantity }
-      });
+    try {
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(item.productId, {
+          $inc: { stock: item.quantity }
+        });
+      }
+    } catch (stockError) {
+      // Nếu không thể cập nhật stock (shard product bị down), vẫn cho phép cancel order
+      console.warn(`Warning: Could not restore stock for order ${order.orderCode}:`, stockError.message);
     }
   }
 
   order.status = 'cancelled';
-  await order.save();
 
-  // Log activity
-  await Activity.log({
-    userId: req.user._id,
-    username: req.user.username,
-    action: 'cancel_order',
-    entityType: 'order',
-    entityId: order._id,
-    branch: order.branch,
-    details: { orderCode: order.orderCode },
-    ipAddress: req.ip
-  });
+  try {
+    await order.save();
+  } catch (saveError) {
+    console.error(`Error saving cancelled order ${order.orderCode}:`, saveError.message);
+    throw saveError;
+  }
+
+  // Log activity - không block nếu fail
+  try {
+    await Activity.log({
+      userId: req.user._id,
+      username: req.user.username,
+      action: 'cancel_order',
+      entityType: 'order',
+      entityId: order._id,
+      branch: order.branch,
+      details: { orderCode: order.orderCode },
+      ipAddress: req.ip
+    });
+  } catch (logError) {
+    console.warn(`Warning: Could not log activity for cancelled order ${order.orderCode}:`, logError.message);
+  }
 
   res.json({
     success: true,

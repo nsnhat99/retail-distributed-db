@@ -3,6 +3,8 @@ const Product = require('../models/Product');
 const User = require('../models/User');
 const Activity = require('../models/Activity');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
+const { buildQueryWithAvailableBranches } = require('../middleware/shardFilter');
+const { getUnavailableBranches } = require('../services/shardHealth');
 
 // @desc    Get revenue statistics
 // @route   GET /api/stats/revenue
@@ -10,21 +12,24 @@ const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const getRevenueStats = asyncHandler(async (req, res) => {
   const { startDate, endDate, branch, groupBy = 'day' } = req.query;
 
-  // Build match stage
-  const matchStage = {
+  // Build match stage with shard health awareness
+  const branchResult = buildQueryWithAvailableBranches({
     status: 'completed',
     createdAt: {
       $gte: new Date(startDate || new Date().setMonth(new Date().getMonth() - 1)),
       $lte: new Date(endDate || new Date())
     }
-  };
+  }, {
+    userRole: req.user.role,
+    userBranch: req.user.branch,
+    requestedBranch: branch
+  });
 
-  // Staff chỉ xem stats của branch mình
-  if (req.user.role !== 'admin') {
-    matchStage.branch = req.user.branch;
-  } else if (branch) {
-    matchStage.branch = branch;
+  if (branchResult.unavailable) {
+    throw new AppError(branchResult.error, 503);
   }
+
+  const matchStage = branchResult.query;
 
   // Group by configuration
   let groupByConfig;
@@ -97,21 +102,26 @@ const getRevenueStats = asyncHandler(async (req, res) => {
 const getTopProducts = asyncHandler(async (req, res) => {
   const { limit = 10, branch, startDate, endDate } = req.query;
 
-  // Build match stage
-  const matchStage = { status: 'completed' };
+  // Build match stage with shard health awareness
+  const baseQuery = { status: 'completed' };
 
   if (startDate || endDate) {
-    matchStage.createdAt = {};
-    if (startDate) matchStage.createdAt.$gte = new Date(startDate);
-    if (endDate) matchStage.createdAt.$lte = new Date(endDate);
+    baseQuery.createdAt = {};
+    if (startDate) baseQuery.createdAt.$gte = new Date(startDate);
+    if (endDate) baseQuery.createdAt.$lte = new Date(endDate);
   }
 
-  // Staff chỉ xem stats của branch mình
-  if (req.user.role !== 'admin') {
-    matchStage.branch = req.user.branch;
-  } else if (branch) {
-    matchStage.branch = branch;
+  const branchResult = buildQueryWithAvailableBranches(baseQuery, {
+    userRole: req.user.role,
+    userBranch: req.user.branch,
+    requestedBranch: branch
+  });
+
+  if (branchResult.unavailable) {
+    throw new AppError(branchResult.error, 503);
   }
+
+  const matchStage = branchResult.query;
 
   const topProducts = await Order.aggregate([
     { $match: matchStage },
@@ -142,13 +152,23 @@ const getTopProducts = asyncHandler(async (req, res) => {
 const getStatsByBranch = asyncHandler(async (req, res) => {
   const { startDate, endDate } = req.query;
 
-  // Build match stage
+  // Build match stage - exclude unavailable branches
+  const unavailableBranches = getUnavailableBranches();
   const matchStage = { status: 'completed' };
 
   if (startDate || endDate) {
     matchStage.createdAt = {};
     if (startDate) matchStage.createdAt.$gte = new Date(startDate);
     if (endDate) matchStage.createdAt.$lte = new Date(endDate);
+  }
+
+  // Exclude unavailable branches - use $in for available branches to avoid querying down shards
+  const availableBranches = ['hanoi', 'danang', 'hcm'].filter(
+    b => !unavailableBranches.includes(b)
+  );
+
+  if (unavailableBranches.length > 0) {
+    matchStage.branch = { $in: availableBranches };
   }
 
   const branchStats = await Order.aggregate([
@@ -164,9 +184,14 @@ const getStatsByBranch = asyncHandler(async (req, res) => {
     { $sort: { totalRevenue: -1 } }
   ]);
 
-  // Get product count by branch
+  // Get product count by branch - also filter by available branches
+  const productMatchStage = { isActive: true };
+  if (unavailableBranches.length > 0) {
+    productMatchStage.branch = { $in: availableBranches };
+  }
+
   const productsByBranch = await Product.aggregate([
-    { $match: { isActive: true } },
+    { $match: productMatchStage },
     {
       $group: {
         _id: '$branch',
@@ -188,7 +213,11 @@ const getStatsByBranch = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    data: { branchStats: merged }
+    data: { branchStats: merged },
+    ...(unavailableBranches.length > 0 && {
+      warning: `Một số chi nhánh không khả dụng: ${unavailableBranches.join(', ')}`,
+      excludedBranches: unavailableBranches
+    })
   });
 });
 
@@ -196,17 +225,27 @@ const getStatsByBranch = asyncHandler(async (req, res) => {
 // @route   GET /api/stats/dashboard
 // @access  Private (Admin, Staff)
 const getDashboardOverview = asyncHandler(async (req, res) => {
-  const branch = req.user.role !== 'admin' ? req.user.branch : req.query.branch;
+  const requestedBranch = req.user.role !== 'admin' ? req.user.branch : req.query.branch;
+
+  // Check shard availability
+  const branchResult = buildQueryWithAvailableBranches({}, {
+    userRole: req.user.role,
+    userBranch: req.user.branch,
+    requestedBranch: requestedBranch
+  });
+
+  if (branchResult.unavailable) {
+    throw new AppError(branchResult.error, 503);
+  }
 
   // Date ranges
   const today = new Date();
   const startOfDay = new Date(today.setHours(0, 0, 0, 0));
   const endOfDay = new Date(today.setHours(23, 59, 59, 999));
   const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-  const startOfYear = new Date(today.getFullYear(), 0, 1);
 
-  // Build match conditions
-  const branchMatch = branch ? { branch } : {};
+  // Build match conditions with available branches filter
+  const branchMatch = branchResult.query;
 
   // Today's stats
   const todayStats = await Order.aggregate([
@@ -285,7 +324,9 @@ const getDashboardOverview = asyncHandler(async (req, res) => {
       lowStockProducts,
       recentOrders,
       recentActivities
-    }
+    },
+    ...(branchResult.warning && { warning: branchResult.warning }),
+    ...(branchResult.excludedBranches && { excludedBranches: branchResult.excludedBranches })
   });
 });
 
@@ -295,19 +336,25 @@ const getDashboardOverview = asyncHandler(async (req, res) => {
 const getSalesByCategory = asyncHandler(async (req, res) => {
   const { startDate, endDate, branch } = req.query;
 
-  const matchStage = { status: 'completed' };
+  const baseQuery = { status: 'completed' };
 
   if (startDate || endDate) {
-    matchStage.createdAt = {};
-    if (startDate) matchStage.createdAt.$gte = new Date(startDate);
-    if (endDate) matchStage.createdAt.$lte = new Date(endDate);
+    baseQuery.createdAt = {};
+    if (startDate) baseQuery.createdAt.$gte = new Date(startDate);
+    if (endDate) baseQuery.createdAt.$lte = new Date(endDate);
   }
 
-  if (req.user.role !== 'admin') {
-    matchStage.branch = req.user.branch;
-  } else if (branch) {
-    matchStage.branch = branch;
+  const branchResult = buildQueryWithAvailableBranches(baseQuery, {
+    userRole: req.user.role,
+    userBranch: req.user.branch,
+    requestedBranch: branch
+  });
+
+  if (branchResult.unavailable) {
+    throw new AppError(branchResult.error, 503);
   }
+
+  const matchStage = branchResult.query;
 
   const categoryStats = await Order.aggregate([
     { $match: matchStage },

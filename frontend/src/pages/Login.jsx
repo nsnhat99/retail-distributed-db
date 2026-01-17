@@ -102,10 +102,13 @@ const Login = () => {
           </p>
           <div className="text-xs text-gray-600 space-y-1">
             <p>
-              <span className="font-medium">Admin:</span> admin_hanoi / 123456
+              <span className="font-medium">Super Admin:</span> super_admin / 123456
             </p>
             <p>
-              <span className="font-medium">Staff:</span> staff_hanoi_1 / 123456
+              <span className="font-medium">Admin HN:</span> admin_hanoi / 123456
+            </p>
+            <p>
+              <span className="font-medium">Staff:</span> staff_danang_1 / 123456
             </p>
           </div>
         </div>

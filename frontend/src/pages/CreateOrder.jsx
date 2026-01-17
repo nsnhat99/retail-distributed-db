@@ -1,11 +1,13 @@
 import { useState, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
 import { productAPI, orderAPI, userAPI } from "../services/api"
+import { useAuth } from "../context/AuthContext"
 import { toast } from "react-toastify"
 import { HiOutlinePlus, HiOutlineTrash, HiOutlineSearch } from "react-icons/hi"
 
 const CreateOrder = () => {
   const navigate = useNavigate()
+  const { user } = useAuth()
   const [products, setProducts] = useState([])
   const [customers, setCustomers] = useState([])
   const [loading, setLoading] = useState(false)
@@ -19,6 +21,7 @@ const CreateOrder = () => {
     paymentMethod: "cash",
     note: "",
     discount: 0,
+    branch: "",
   })
 
   useEffect(() => {
@@ -113,6 +116,11 @@ const CreateOrder = () => {
       toast.error("Vui lòng thêm sản phẩm")
       return
     }
+    // Super admin phải chọn branch
+    if (user?.role === "admin" && !user?.branch && !form.branch) {
+      toast.error("Vui lòng chọn chi nhánh")
+      return
+    }
     setLoading(true)
     try {
       const orderData = {
@@ -123,6 +131,10 @@ const CreateOrder = () => {
         })),
         discount: form.discount || 0,
         tax,
+      }
+      // Xóa customerId nếu rỗng để tránh lỗi ObjectId
+      if (!orderData.customerId) {
+        delete orderData.customerId
       }
       await orderAPI.create(orderData)
       toast.success("Tạo đơn hàng thành công!")
@@ -326,6 +338,28 @@ const CreateOrder = () => {
           <div className="card">
             <h3 className="font-semibold mb-4">Thanh toán</h3>
             <div className="space-y-4">
+              {user?.role === "admin" && (
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Chi nhánh {!user?.branch && "*"}
+                  </label>
+                  <select
+                    required={!user?.branch}
+                    className="input-field"
+                    value={form.branch}
+                    onChange={(e) =>
+                      setForm({ ...form, branch: e.target.value })
+                    }
+                  >
+                    <option value="">
+                      {user?.branch ? "Chi nhánh của bạn" : "Chọn chi nhánh"}
+                    </option>
+                    <option value="hanoi">Hà Nội</option>
+                    <option value="danang">Đà Nẵng</option>
+                    <option value="hcm">TP.HCM</option>
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium mb-1">
                   Phương thức
